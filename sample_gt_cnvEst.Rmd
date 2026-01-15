@@ -1,0 +1,497 @@
+---
+title: "Sample Genotype CNV Estimation"
+output: html_document
+author: "Alexis Weber"
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, fig.width = 20, fig.height = 10, out.width = "100%")
+```
+
+### File
+sample_gt_cnvEst.Rmd
+
+
+# Index {#index}
+- [Index](#index)
+- [Overview](#ov)
+- [Initialization](#init)
+- [Data](#data)
+  - [HSA21 Log(R) Ratio](#lrr)
+  - [B Allele Frequency](#baf)
+- [Copy Number Analysis Object](#cna)
+  - [Build CNA Object](#build_cna)
+  - [Process CNA Object](#proc_cna)
+- [Segmental Duplication](#seg_dup)
+  - [Estimate HSA21 Gain Coverage](#gain_cov)
+  - [HSA21 Gain Coverage LRR](#plot_gain_cov)
+- [Mosacism](#mosac)
+  - [Estimate Ts21 Mosacism with BAF](#est_mosac)
+  - [HSA21 BAF Mosaic Fraction](#plot_mosac)
+
+# Overview {#ov}
+
+>Genotype data (snp, chr, pos, donor.gt, donor.lrr, donor.baf) from samples that are either disomic (two copies) or trisomic (three copies) for human chromosome 21 (HSA21). Identify contiguous intra-chromosomal segments by calculating significantly differential average LRR. Smooth these segments and utilize mapped regions to calculate segmental duplication and mosacism. 
+1. Estimate segmental duplication by calculating the proportion of HSA21 chromosome with average LRR indicative of triplication (> 0.2). 
+2. Estimate the fraction of triplicated/mosaic cells by BAF heterozygosity.
+
+## Metrics
+
+**LogRRatio (LRR)**: log2(observed signal intensity/expected intensity) with expected based on set of reference samples with normal copy number of 2. Perfect trisomic LRR = log2(3/2) = log2(1.5) = 0.585
+
+**B Allele Frequency**: Fraction of intensity from the B allele of the total allelic intensity for each SNP locus (B/A+B). Diploid frequencies: AA = 0, AB = 0.5, BB = 1. Triploid frequencies: AAA = 0, AAB = 0.33, ABB = 0.67, BBB=1. 
+
+# Environment Initialization {#init} 
+
+## Initialize Packages
+
+```{r init pkg, message=FALSE}
+
+#Data Manipulation
+library(dplyr)
+library(stringr)
+library(purrr)
+library(data.table)
+
+#Plotting
+library(ggplot2)
+
+#Segment
+library(changepoint)
+library(segmented)
+#library(bcp)
+
+#DNA Copy
+library(DNAcopy)
+
+#RMarkdown
+library(knitr)
+library(kableExtra)
+
+```
+
+## Initialize Directories (harddrive)
+
+```{r init dir}
+
+out.dir <- paste0("./Ts21_trisomyType/")
+function.dir <- ("/Users/alexis.weber/Desktop/Rfunctions/")
+
+```
+
+## Intialize Functions
+
+```{r init func}
+
+source(paste0(function.dir, "plot_baf_allchr_function_v1.R"))
+source(paste0(function.dir, "gain_coverage_function_v1.R"))
+source(paste0(function.dir, "plot_lrr_seg_function_v1.R"))
+source(paste0(function.dir, "estimate_mosaic_function_v1.R"))
+source(paste0(function.dir, "plot_baf_mosaic_function_v1.R"))
+
+```
+
+# Data {#data}
+
+## Load Ts21 Neocortex Donor GT Data
+
+```{r load gt}
+gt <- read.csv("tissueGT_donors_df.csv")[,-1]
+```
+
+```{r deid, echo=FALSE}
+
+colnames(gt)[4:9] <- c("Donor1.GType", "Donor1.B.Allele.Freq", "Donor1.Log.R.Ratio", "Donor2.GType", "Donor2.B.Allele.Freq", "Donor2.Log.R.Ratio")
+
+```
+
+### Processed Ts21 Neocortex GT Data by Donor
+
+```{r proc gt df}
+
+gt %>%
+  slice_head(n=10) %>%
+  dplyr::select(c(1:9)) %>%
+  kbl(caption="Pre-Processed Ts21 GT Data by Donor") %>%
+  kable_styling(
+    bootstrap_optio = c("hover", "condensed"),
+    position = "center",
+    html_font = "Arial Narrow") %>%
+  kable_paper(full_width=F)
+
+```
+
+
+```{r reload, echo=FALSE}
+gt <- read.csv("tissueGT_donors_df.csv")[,-1]
+```
+
+## Vectorize GT Data by Donor
+
+### Donors
+
+```{r donor}
+
+donors <- gt %>%
+  dplyr::select(4:ncol(gt)) %>%
+  names() %>%
+  str_remove("\\..*") %>%
+  unique()
+
+
+```
+
+### Split Genotype Data by Donor
+
+```{r split list}
+
+colnames(gt)[1] <- "SNP"
+
+chr_pos_snp <- names(gt)[1:3]
+
+donor_gt_list <- map(set_names(donors), function(don) {
+  donor_cols <- names(gt)[str_starts(names(gt), paste0(don, "\\."))]
+  gt %>% 
+    dplyr::select(all_of(chr_pos_snp), all_of(donor_cols)) %>%
+    rename_with(~str_remove(.x, paste0("^", don, "\\.")),
+                .cols=all_of(donor_cols))
+})
+
+donor_gt_list[[7]] %>%
+  slice_head(n=10) %>%
+  kbl(caption = paste0("Disomic HSA21 Sample Split GT Data")) %>%
+  kable_styling(
+    bootstrap_options = c("hover", "condensed"),
+    position = "center",
+    html_font = "Arial Narrow") %>%
+  kable_paper(full_width = F)
+  
+```
+
+### Retain only HSA21 and Remove NA
+
+```{r fil hsa21}
+
+donor_hsa21_list <- lapply(donor_gt_list, function(df) {
+  df %>% filter(Chr == "21", !is.na(Log.R.Ratio) & !is.na(B.Allele.Freq))
+})
+
+donor_hsa21_list[[7]] %>%
+  slice_head(n=10) %>%
+  kbl(caption=paste0("Disomic HSA21 Sample Split GT Data")) %>%
+  kable_styling(
+    bootstrap_options = c("hover", "condensed"),
+    position= "center",
+    html_font = "Arial Narrow") %>%
+  kable_paper(full_width = FALSE)
+
+
+```
+
+## Log(R) Ratio of HSA21 {#lrr .tabset .tabset-fade}
+
+```{r lrr plots}
+
+lrr_plots <- purrr::imap(donor_hsa21_list, ~{
+  dn <- .y
+  df <- .x
+
+  ggplot(df, aes(x = Position, y = Log.R.Ratio)) +
+    geom_point(size = 0.7, alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = 0.2, linetype = "dotted", color = "red", linewidth = 0.6) +
+    labs(
+      title = "Log R Ratio (LRR) across genome",
+      x = "Genomic Position",
+      y = "Log R Ratio (LRR)"
+    ) +
+    theme_bw()
+})
+
+```
+
+### Disomic Sample HSA21 LRR
+
+```{r ds lrr, fig.width=5, fig.height=5}
+
+lrr_plots[[7]] +
+    ggtitle("Disomic HSA21 Sample, HSA21 LRR")
+
+```
+
+### Trisomic Sample HSA21 LRR
+
+```{r ts lrr, fig.width=5, fig.height=5}
+
+lrr_plots[[6]] +
+    ggtitle("Trisomic HSA21 Sample, HSA21 LRR")
+
+```
+
+## B-Allele Frequency {#baf .tabset .tabset-fade}
+
+```{r baf plot}
+
+baf_plots <- purrr::imap(donor_gt_list, ~{
+  dn <- .y
+  df <- .x
+  
+  plot_baf(df)
+
+})
+
+```
+
+### Disomic Sample BAF {.active}
+
+```{r ds baf, fig.width=12, fig.height=8}
+
+baf_plots[[7]] +
+    ggtitle("Disomic Sample BAF")
+
+```
+
+### Trisomic Sample BAF
+
+```{r ts baf, fig.width=12, fig.height=8}
+
+baf_plots[[6]] +
+    ggtitle("Trisomic Sample BAF")
+
+```
+
+
+# Copy Number Analysis Object {#cna}
+
+## Build CNA Object with LRR {#build_cna}
+
+Per donor, input GT data: chromosome, position, Log.R.Ratio, data.type = "logratio", name of the donor.
+
+```{r cna obj lrr, message=FALSE}
+
+
+cna_list <- lapply(seq_along(donor_hsa21_list), function(i) {
+  df <- donor_hsa21_list[[i]]
+  cna.obj <- CNA(genomdat = df$Log.R.Ratio,
+               chrom    = df$Chr,
+               maploc   = df$Pos,
+               data.type= "logratio",
+               sampleid = names(donor_hsa21_list)[i])
+  cna.obj
+})
+
+names(cna_list) <- names(donor_hsa21_list)
+
+
+```
+
+## Process CNA Object {#proc_cna}
+
+#### Smoothing
+
+>Smooth LRR: per probe, set a local window (smooth.region = 10, i.e. 10 probes in either direction) and estimate local center/scale, then flag outliers (outlier.SD.scale=4, i.e. 4 SD units threshold). Outliers are then scaled down (smooth.SD.scale ± 2, i.e. within 2 SD units).
+
+#### Segmentation
+
+>Segment chromosome: per probe, identify changepoints by the largest LRR mean difference between earlier (closer to centromere) or later (closer to q telomere) positions on the chromosome, by maximal t statistic (pvalue < alpha). Within segments, internal changepoints are identified by recursively testing each probe (min.width). Output per segment by the chromosome, segment start, segment end, the number of probes (num.mark) and the mean LRR (seg.mean).
+
+#### Segment Copy Number
+
+>CN per segment is approximated by the mean LRR: greater than 0.15 is approximately 3 copies and less than -0.30 is 1 copy and between these LRR is approximately 2 copies.
+
+
+```{r smooth cna}
+
+seg_df_list <- lapply(cna_list, function(df){
+  seg <- segment(smooth.CNA(df), alpha=0.01, min.width=2, verbose=0)
+  segdf <- seg$output
+  segdf$CN <- with(segdf, ifelse(seg.mean >  0.15, 3,
+                        ifelse(seg.mean < -0.30, 1, 2)))
+  segdf
+})
+
+seg_df_list[[7]] %>%
+  slice_head(n=10) %>%
+  dplyr::select(2:7) %>%
+  kbl(caption = "Disomic HSA21 Sample LRR Segments") %>%
+  kable_styling(
+    bootstrap_options = c("hover", "condensed"),
+    position = "center",
+    html_font = "Arial Narrow") %>%
+  kable_paper(full_width = F)
+
+
+```
+
+# Segmental Duplication Analysis by LRR {#seg_dup}
+
+## HSA21 Gain Coverage {#gain_cov}
+
+Summarize the extent of HSA21q that is covered by segments with average LRR > 0.15 or CN =3. 
+
+```{r gain cov}
+
+hsa21_gain_prop_list <- lapply(seq_along(donor_hsa21_list), function(i){
+  gain_coverage(donor_hsa21_list[[i]], seg_df_list[[i]], "21")
+})
+names(hsa21_gain_prop_list) <- names(donor_hsa21_list)
+
+```
+
+## HSA21 Gain Coverage {#plot_gain_cov .tabset .tabset-fade}
+
+```{r lrr seg dup plot}
+
+lrr_seg_plot_list <- purrr::pmap(
+  list(df1 = donor_hsa21_list, seg = seg_df_list, prop = hsa21_gain_prop_list),
+  function(df1, seg, prop){
+    gain_df1 <- dplyr::filter(seg, chrom == "21", CN == 3)
+    plot_lrr_seg(df1, gain_df1, prop)
+  }
+)
+
+names(lrr_seg_plot_list) <- names(donor_hsa21_list)
+
+```
+
+### Disomic Sample HSA21 LRR Segment CN Prediction
+
+None of the contiguous segments have an average LRR that constitutes CN =3. Average LRR = 0 across HSA21.
+
+```{r d146 lrr seg plot, fig.width = 5, fig.height = 5}
+
+lrr_seg_plot_list[[7]]
+
+```
+
+### Trisomic Sample HSA21 LRR Segment CN Prediction
+
+Over 50% of the contiguous segments have average LRR consistent with CN = 3 (89%), highlighted in gray. Average LRR > 0 across HSA21.
+
+```{r d96 lrr seg plot, fig.width=5, fig.height=5}
+
+lrr_seg_plot_list[[6]]
+
+```
+
+
+# Mosacism {#mosac}
+
+## Estimate HSA21 Mosacism with BAF
+
+>Pull the BAF of heterozygous SNPs within each segment. Calculate the median BAF for for the lower (AAB) and upper (ABB) heterozygote clusters to determine the extent of trisomy per segment. 
+
+The median BAF upper heterozygote cluster  
+
+$$
+BAF(upper) = (1-m)(0.5) + m(0.67)
+$$
+
+The median BAF lower heterozygote cluster is equal to the sum of the product of the fraction of diploid mosaic cells and the expected diploid heterozygote BAF (0.5, AB), and the product of the fraction of triploid mosaic cells and the expected lower triploid heterozygote BAF (0.33, AAB).
+
+$$
+BAF(lower) = (1-m)(0.5) + m(0.33)
+$$
+
+Simplified, the median BAF upper heterozygote cluster is equal to the sum of the expected diploid heterozygote BAF (0.5, AB) and the product of 0.17 and the triploid fraction. The median BAF lower heterozygote cluster is equal to the difference between the expected diploid heterozygote BAF (0.5, AB) and the product of 0.17 and the triploid fraction.
+
+$$
+BAF(upper) = 0.5 + 0.17m
+BAF(lower) = 0.5 - 0.17m
+$$
+
+Simplified to isolate m, the fraction of triploid mosaic cells is equal to the quotient of the difference between median upper heterozygote BAF and the expected diploid heterozygote BAF (0.5, AB) and 0.17. Simplified even further, the fraction of triploid mosaic cells is equal to the product of 5.88 (1/0.17) and the difference between median upper heterozygote BAF and the expected diploid heterozygtoe BAF (0.5, AB)
+
+$$
+m = \frac{BAF(upper) - 0.5}{0.17}
+$$
+$$
+m = 5.88(BAF(upper)-0.5)
+$$
+
+Establish function that assesses BAF heterozygosity in triplicated regions identified as CN=3 by CNA. A heterozygous BAF will split 0.5 ± m/6 . Therefore m ≈ 6 * (median_upper_band - 0.5) where m is the mosaic fraction of cells with trisomy.
+
+```{r est mosac}
+
+
+mosaic_out_list <- purrr::map(seq_along(donor_hsa21_list), function(n){
+
+  gt_df  <- donor_hsa21_list[[n]]
+  seg_df <- seg_df_list[[n]]
+
+  if (nrow(seg_df) == 0) return(NULL)
+
+  mosaic_tab <- purrr::pmap_dfr(
+    list(seg_df$chrom, seg_df$loc.start, seg_df$loc.end),
+    ~ estimate_mosaic(gt_df, ..1, ..2, ..3)
+  )
+
+  dplyr::bind_cols(
+    seg_df %>% dplyr::select(chrom, loc.start, loc.end, num.mark, seg.mean, CN),
+    mosaic_tab
+  )
+})
+
+names(mosaic_out_list) <- names(donor_hsa21_list)
+
+mosaic_out_list[[6]] %>%
+  slice_head(n=10) %>%
+  kbl(caption = "Trisomic HSA21 Sample Triplicated Fraction") %>%
+  kable_styling(
+    bootstrap_options = c("hover", "condensed"),
+    position = "center",
+    html_font = "Arial Narrow") %>%
+  kable_paper(full_width = F)
+
+
+
+```
+
+## HSA21 Mosaic Fraction {#plot_mosac .tabset .tabset-fade}
+
+```{r plot baf mosac}
+
+
+baf_mos_plot_list <- purrr::pmap(
+  list(df1 = donor_hsa21_list, seg = seg_df_list),
+  function(df1, seg){
+    plot_baf_mosaic(df1, seg)
+  }
+)
+
+names(baf_mos_plot_list) <- names(donor_hsa21_list)
+
+
+```
+
+### Disomic Sample HSA21 BAF Distribution
+
+Heterozygote cluster BAF are 50% indicative of two copies of HSA21. Mosaic fraction below 50% in non-trisomic samples confirms disomy.
+
+```{r ds baf mos plot, fig.width = 5, fig.height = 5}
+
+baf_mos_plot_list[[7]]
+
+```
+
+
+### Trisomic Sample HSA21 BAF Distriution
+
+Heterozygote cluster BAF at approximately 33% and 66% indicative of three copies of HSA21. Non-Mosaic: over 50% of the HSA21 segments have BAF score indicative of CN = 3 indicative of full trisomy over HSA21.
+
+```{r ts baf mos plot, fig.width = 5, fig.height = 5}
+
+baf_mos_plot_list[[6]]
+
+```
+
+
+## Environment
+
+```{r env}
+
+sessionInfo()
+
+```
+
